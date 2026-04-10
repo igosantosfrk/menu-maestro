@@ -1,0 +1,427 @@
+import { serve } from "https://deno.land/std@0.190.0/http/server.ts";
+import { createClient } from "npm:@supabase/supabase-js@2.57.2";
+import Stripe from "https://esm.sh/stripe@18.5.0";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
+};
+
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const WEBHOOK_BASE = `${SUPABASE_URL}/functions/v1/payment-webhook`;
+
+// ─── Gateway Adapters ───────────────────────────────────────
+
+async function createAsaasPayment(
+  tenant: any, order: any, items: any[], origin: string
+): Promise<{ paymentUrl: string; paymentId: string }> {
+  const headers = { "Content-Type": "application/json", access_token: tenant.asaas_api_key };
+  const extRef = `${tenant.id}_${order.customer_phone || "guest"}`;
+
+  // Find or create customer
+  const findRes = await fetch(
+    `https://api.asaas.com/v3/customers?externalReference=${encodeURIComponent(extRef)}`,
+    { headers }
+  );
+  const findData = await findRes.json();
+  let customerId: string;
+
+  if (findData.data?.length > 0) {
+    customerId = findData.data[0].id;
+  } else {
+    const createRes = await fetch("https://api.asaas.com/v3/customers", {
+      method: "POST", headers,
+      body: JSON.stringify({
+        name: order.customer_name, email: order.customer_email || undefined,
+        mobilePhone: (order.customer_phone || "").replace(/\D/g, ""),
+        externalReference: extRef, cpfCnpj: "00000000000",
+      }),
+    });
+    const createData = await createRes.json();
+    if (createData.errors) throw new Error("Erro ao criar cliente no Asaas");
+    customerId = createData.id;
+  }
+
+  // Create payment
+  const today = new Date().toISOString().split("T")[0];
+  const payRes = await fetch("https://api.asaas.com/v3/payments", {
+    method: "POST", headers,
+    body: JSON.stringify({
+      customer: customerId, billingType: "UNDEFINED",
+      value: order.total, dueDate: today,
+      description: `Pedido #${order.order_number} - ${tenant.name || "Delivery"}`,
+      externalReference: order.id,
+    }),
+  });
+  const payData = await payRes.json();
+  if (payData.errors) throw new Error("Erro ao criar cobranca no Asaas");
+
+  return { paymentUrl: payData.invoiceUrl, paymentId: payData.id };
+}
+
+async function createMercadoPagoPayment(
+  tenant: any, order: any, items: any[], origin: string
+): Promise<{ paymentUrl: string; paymentId: string }> {
+  const mpItems = items.map((i: any) => ({
+    title: i.name, unit_price: Number(i.price), quantity: i.quantity,
+    currency_id: "BRL",
+  }));
+
+  if (order.delivery_fee > 0) {
+    mpItems.push({ title: "Taxa de Entrega", unit_price: Number(order.delivery_fee), quantity: 1, currency_id: "BRL" });
+  }
+
+  const slug = tenant.slug || "";
+  const body = {
+    items: mpItems,
+    back_urls: {
+      success: `${origin}/${slug}?payment=success&order=${order.order_number}`,
+      failure: `${origin}/${slug}?payment=failed&order=${order.order_number}`,
+      pending: `${origin}/${slug}?payment=pending&order=${order.order_number}`,
+    },
+    auto_return: "approved",
+    external_reference: order.id,
+    notification_url: `${WEBHOOK_BASE}?gateway=mercadopago&tenant_id=${tenant.id}`,
+  };
+
+  const res = await fetch("https://api.mercadopago.com/checkout/preferences", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${tenant.mercadopago_access_token}`,
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!data.init_point) throw new Error(data.message || "Erro ao criar preferencia no Mercado Pago");
+
+  return { paymentUrl: data.init_point, paymentId: data.id };
+}
+
+async function createPagSeguroPayment(
+  tenant: any, order: any, items: any[], origin: string
+): Promise<{ paymentUrl: string; paymentId: string }> {
+  const psItems = items.map((i: any) => ({
+    reference_id: i.name.substring(0, 64),
+    name: i.name, quantity: i.quantity,
+    unit_amount: Math.round(Number(i.price) * 100),
+  }));
+
+  if (order.delivery_fee > 0) {
+    psItems.push({
+      reference_id: "delivery_fee", name: "Taxa de Entrega",
+      quantity: 1, unit_amount: Math.round(Number(order.delivery_fee) * 100),
+    });
+  }
+
+  const slug = tenant.slug || "";
+  const body = {
+    reference_id: order.id,
+    customer: {
+      name: order.customer_name,
+      email: order.customer_email || "cliente@email.com",
+      phones: [{ country: "55", area: (order.customer_phone || "").replace(/\D/g, "").substring(0, 2), number: (order.customer_phone || "").replace(/\D/g, "").substring(2) }],
+    },
+    items: psItems,
+    redirect_urls: {
+      return_url: `${origin}/${slug}?payment=success&order=${order.order_number}`,
+    },
+    notification_urls: [`${WEBHOOK_BASE}?gateway=pagseguro&tenant_id=${tenant.id}`],
+  };
+
+  const res = await fetch("https://api.pagseguro.uol.com.br/checkouts", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${tenant.pagseguro_token}`,
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+
+  const payLink = data.links?.find((l: any) => l.rel === "PAY");
+  if (!payLink) throw new Error(data.error_messages?.[0]?.description || "Erro ao criar checkout PagSeguro");
+
+  return { paymentUrl: payLink.href, paymentId: data.id };
+}
+
+async function createPagarmePayment(
+  tenant: any, order: any, items: any[], origin: string
+): Promise<{ paymentUrl: string; paymentId: string }> {
+  const pgItems = items.map((i: any) => ({
+    amount: Math.round(Number(i.price) * 100),
+    description: i.name, quantity: i.quantity, code: i.name.substring(0, 52),
+  }));
+
+  if (order.delivery_fee > 0) {
+    pgItems.push({
+      amount: Math.round(Number(order.delivery_fee) * 100),
+      description: "Taxa de Entrega", quantity: 1, code: "delivery_fee",
+    });
+  }
+
+  const slug = tenant.slug || "";
+  const body = {
+    items: pgItems,
+    customer: {
+      name: order.customer_name,
+      email: order.customer_email || "cliente@email.com",
+      phones: { mobile_phone: { country_code: "55", area_code: (order.customer_phone || "").replace(/\D/g, "").substring(0, 2), number: (order.customer_phone || "").replace(/\D/g, "").substring(2) } },
+    },
+    payments: [{
+      payment_method: "checkout",
+      checkout: {
+        accepted_payment_methods: ["credit_card", "pix", "boleto"],
+        success_url: `${origin}/${slug}?payment=success&order=${order.order_number}`,
+      },
+    }],
+    metadata: { order_id: order.id, tenant_id: tenant.id },
+  };
+
+  const apiKey = tenant.pagarme_api_key;
+  const res = await fetch("https://api.pagar.me/core/v5/orders", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: "Basic " + btoa(apiKey + ":"),
+    },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+
+  const paymentUrl = data.checkouts?.[0]?.payment_url;
+  if (!paymentUrl) throw new Error(data.message || "Erro ao criar checkout Pagar.me");
+
+  return { paymentUrl, paymentId: data.id };
+}
+
+async function createStripePayment(
+  tenant: any, order: any, items: any[], origin: string
+): Promise<{ paymentUrl: string; paymentId: string }> {
+  const stripe = new Stripe(tenant.stripe_secret_key, { apiVersion: "2025-08-27.basil" });
+
+  const lineItems = items.map((i: any) => ({
+    price_data: {
+      currency: "brl",
+      product_data: { name: i.name },
+      unit_amount: Math.round(Number(i.price) * 100),
+    },
+    quantity: i.quantity,
+  }));
+
+  if (order.delivery_fee > 0) {
+    lineItems.push({
+      price_data: {
+        currency: "brl",
+        product_data: { name: "Taxa de Entrega" },
+        unit_amount: Math.round(Number(order.delivery_fee) * 100),
+      },
+      quantity: 1,
+    });
+  }
+
+  const slug = tenant.slug || "";
+  const session = await stripe.checkout.sessions.create({
+    payment_method_types: ["card", "boleto", "pix"],
+    line_items: lineItems,
+    mode: "payment",
+    success_url: `${origin}/${slug}?payment=success&order=${order.order_number}`,
+    cancel_url: `${origin}/${slug}?payment=cancelled&order=${order.order_number}`,
+    metadata: { order_id: order.id, tenant_id: tenant.id, order_number: String(order.order_number) },
+    customer_email: order.customer_email || undefined,
+    payment_intent_data: { metadata: { order_id: order.id, tenant_id: tenant.id } },
+  });
+
+  return { paymentUrl: session.url!, paymentId: session.id };
+}
+
+// ─── Main Handler ───────────────────────────────────────────
+
+serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response(null, { headers: corsHeaders });
+  }
+
+  try {
+    const body = await req.json();
+    const {
+      tenant_id, items, customer_name, customer_phone, customer_email,
+      delivery_address, delivery_neighborhood, delivery_city, delivery_notes,
+      delivery_fee, discount, coupon_code, coupon_id, session_id,
+      utm_source, utm_medium, utm_campaign, utm_term, utm_content, utm_ad_link,
+    } = body;
+
+    if (!tenant_id || !items?.length || !customer_name || !customer_phone) {
+      return new Response(JSON.stringify({ error: "Campos obrigatorios ausentes" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+
+    // Get tenant
+    const { data: tenant, error: tenantError } = await supabaseAdmin
+      .from("tenants")
+      .select("id, name, slug, payment_gateway, asaas_api_key, mercadopago_access_token, pagseguro_token, pagseguro_email, pagarme_api_key, stripe_secret_key, stripe_publishable_key")
+      .eq("id", tenant_id)
+      .single();
+
+    if (tenantError || !tenant) {
+      return new Response(JSON.stringify({ error: "Restaurante nao encontrado" }),
+        { status: 404, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    const gateway = tenant.payment_gateway;
+    if (!gateway || gateway === "none") {
+      return new Response(JSON.stringify({ error: "Gateway de pagamento nao configurado" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    // Validate credentials
+    const credMap: Record<string, boolean> = {
+      asaas: !!tenant.asaas_api_key,
+      mercadopago: !!tenant.mercadopago_access_token,
+      pagseguro: !!tenant.pagseguro_token,
+      pagarme: !!tenant.pagarme_api_key,
+      stripe: !!tenant.stripe_secret_key,
+    };
+    if (!credMap[gateway]) {
+      return new Response(JSON.stringify({ error: `Credenciais do ${gateway} nao configuradas` }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    const subtotal = items.reduce((sum: number, i: any) => sum + i.price * i.quantity, 0);
+    const orderTotal = subtotal - (discount || 0) + (delivery_fee || 0);
+
+    // Create order
+    const { data: order, error: orderError } = await supabaseAdmin
+      .from("orders")
+      .insert({
+        tenant_id, customer_name, customer_phone,
+        customer_email: customer_email || null,
+        delivery_address: delivery_address || null,
+        delivery_neighborhood: delivery_neighborhood || null,
+        delivery_city: delivery_city || null,
+        delivery_notes: delivery_notes || null,
+        delivery_fee: delivery_fee || 0,
+        subtotal, discount: discount || 0,
+        coupon_code: coupon_code || null, coupon_id: coupon_id || null,
+        total: orderTotal,
+        payment_method: "online", payment_status: "pending", status: "new",
+        session_id: session_id || null,
+        utm_source: utm_source || null, utm_medium: utm_medium || null,
+        utm_campaign: utm_campaign || null, utm_term: utm_term || null,
+        utm_content: utm_content || null, utm_ad_link: utm_ad_link || null,
+      })
+      .select("id, order_number")
+      .single();
+
+    if (orderError) {
+      console.error("Order error:", orderError);
+      return new Response(JSON.stringify({ error: "Erro ao criar pedido" }),
+        { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    // Insert order items
+    const orderItems = items.map((item: any) => ({
+      order_id: order.id, tenant_id,
+      product_name: item.name, unit_price: item.price,
+      quantity: item.quantity, total: item.price * item.quantity,
+    }));
+    await supabaseAdmin.from("order_items").insert(orderItems);
+
+    // Decrement stock for tracked products
+    for (const item of items) {
+      const { data: product } = await supabaseAdmin
+        .from("products")
+        .select("id, track_stock, stock_quantity")
+        .eq("tenant_id", tenant_id)
+        .eq("name", item.name)
+        .single();
+
+      if (product?.track_stock && product.stock_quantity !== null) {
+        await supabaseAdmin
+          .from("products")
+          .update({ stock_quantity: Math.max(0, product.stock_quantity - item.quantity) })
+          .eq("id", product.id);
+      }
+    }
+
+    // Upsert customer
+    const now = new Date().toISOString();
+    const { data: existingCustomer } = await supabaseAdmin
+      .from("customers")
+      .select("id, total_orders, total_spent")
+      .eq("tenant_id", tenant_id)
+      .eq("phone", customer_phone)
+      .maybeSingle();
+
+    if (existingCustomer) {
+      const newTotalOrders = (existingCustomer.total_orders || 0) + 1;
+      const newTotalSpent = (existingCustomer.total_spent || 0) + orderTotal;
+      await supabaseAdmin.from("customers").update({
+        name: customer_name, email: customer_email || null,
+        address: delivery_address || null, neighborhood: delivery_neighborhood || null,
+        city: delivery_city || null,
+        total_orders: newTotalOrders, total_spent: newTotalSpent,
+        avg_ticket: newTotalSpent / newTotalOrders, last_order_at: now,
+      }).eq("id", existingCustomer.id);
+    } else {
+      await supabaseAdmin.from("customers").insert({
+        tenant_id, name: customer_name, phone: customer_phone,
+        email: customer_email || null, address: delivery_address || null,
+        neighborhood: delivery_neighborhood || null, city: delivery_city || null,
+        total_orders: 1, total_spent: orderTotal, avg_ticket: orderTotal,
+        first_order_at: now, last_order_at: now,
+        loyalty_points: 0, loyalty_tier: "bronze", tags: [],
+      });
+    }
+
+    // Enrich order object for adapters
+    const enrichedOrder = {
+      ...order, customer_name, customer_phone, customer_email,
+      total: orderTotal, delivery_fee: delivery_fee || 0,
+    };
+
+    const origin = req.headers.get("origin") || "";
+    let result: { paymentUrl: string; paymentId: string };
+
+    switch (gateway) {
+      case "asaas":
+        result = await createAsaasPayment(tenant, enrichedOrder, items, origin);
+        break;
+      case "mercadopago":
+        result = await createMercadoPagoPayment(tenant, enrichedOrder, items, origin);
+        break;
+      case "pagseguro":
+        result = await createPagSeguroPayment(tenant, enrichedOrder, items, origin);
+        break;
+      case "pagarme":
+        result = await createPagarmePayment(tenant, enrichedOrder, items, origin);
+        break;
+      case "stripe":
+        result = await createStripePayment(tenant, enrichedOrder, items, origin);
+        break;
+      default:
+        return new Response(JSON.stringify({ error: "Gateway nao suportado" }),
+          { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+    }
+
+    // Update order with payment ID
+    await supabaseAdmin.from("orders").update({
+      asaas_payment_id: result.paymentId,
+    }).eq("id", order.id);
+
+    return new Response(JSON.stringify({
+      paymentUrl: result.paymentUrl,
+      order_id: order.id,
+      order_number: order.order_number,
+    }), { status: 200, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+
+  } catch (error) {
+    console.error("Online payment error:", error);
+    return new Response(JSON.stringify({ error: error.message }),
+      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+  }
+});

@@ -1,0 +1,31 @@
+project_id = "mqswmgbpgozzjyrbjcuz"
+
+[functions.fetch-ad-campaigns]
+verify_jwt = false
+
+[functions.create-checkout]
+verify_jwt = false
+
+[functions.create-cash-order]
+verify_jwt = false
+
+[functions.analyze-customer]
+verify_jwt = false
+
+[functions.send-whatsapp-campaigns]
+verify_jwt = false
+
+[functions.stripe-webhook]
+verify_jwt = false
+
+[functions.whatsapp-webhook]
+verify_jwt = false
+
+[functions.whatsapp-send]
+verify_jwt = false
+
+[functions.create-asaas-checkout]
+verify_jwt = false
+
+[functions.asaas-webhook]
+verify_jwt = false
